@@ -1,22 +1,19 @@
-// 顔写真 → 特徴量 (512 次元) をブラウザ内で計算する。写真はどこにも送らない。
-//
-// insightface の buffalo_s と同じ処理を TypeScript で再現している:
-//   1. 検出   det_500m (SCRFD)   … 顔の枠と 5 点ランドマーク   (insightface/model_zoo/scrfd.py)
-//   2. 位置合わせ                 … 5 点を基準位置に合わせて 112x112 に切り出す (face_align.norm_crop)
-//   3. 認識   w600k_mbf (ArcFace) … 512 次元 → L2 正規化        (model_zoo/arcface_onnx.py)
-// 索引側 (Colab) も同じモデル・同じ前処理で作るので、両者の特徴量は比較できる。
+// 顔写真 → 512 次元の特徴量。ブラウザ内で計算し、写真は送らない。
+// insightface buffalo_s と同じ処理（索引側と特徴量が一致することを確認済み）:
+//   1. 検出      det_500m (SCRFD) → 顔の枠と 5 点ランドマーク
+//   2. 位置合わせ  5 点を基準位置に合わせて 112x112 に切り出す (norm_crop)
+//   3. 認識      w600k_mbf (ArcFace) → L2 正規化
 
 import * as ort from 'onnxruntime-web/wasm';
 
-// wasm 本体は Vite がアセットとして同梱する（onnxruntime-web が import.meta.url から参照）
-ort.env.wasm.numThreads = 1; // SharedArrayBuffer (COOP/COEP) 無しでも動くように
+ort.env.wasm.numThreads = 1; // SharedArrayBuffer (COOP/COEP) 無しで動かす
 
 const MODEL_DIR = '/models/';
 const DET_SIZE = 640;
 const DET_THRESH = 0.5;
 const NMS_THRESH = 0.4;
-const MAX_SIDE = 1600; // 索引側もこの大きさに縮めてから検出している
-// arcface の基準ランドマーク (112x112)
+const MAX_SIDE = 1600; // 大きい写真は縮めてから検出する
+// ArcFace の基準ランドマーク (112x112)
 const ARCFACE_DST = [
   [38.2946, 51.6963],
   [73.5318, 51.5014],
@@ -24,9 +21,6 @@ const ARCFACE_DST = [
   [41.5493, 92.3655],
   [70.7299, 92.2041],
 ];
-// 認識モデルの入力正規化 (insightface が w600k_mbf に使う値)
-const REC_MEAN = 127.5;
-const REC_STD = 127.5;
 
 export interface Face {
   box: [number, number, number, number];
@@ -42,7 +36,16 @@ export interface FaceResult {
 
 export class NoFaceError extends Error {}
 
-// ------------------------------------------------------------ models
+/** RGBA 画素 → [1, 3, size, size] の float テンソル ((値 - 127.5) / std) */
+function toTensor(rgba: Uint8ClampedArray, size: number, std: number): ort.Tensor {
+  const n = size * size;
+  const data = new Float32Array(3 * n);
+  for (let i = 0; i < n; i++) {
+    for (let ch = 0; ch < 3; ch++) data[ch * n + i] = (rgba[i * 4 + ch] - 127.5) / std;
+  }
+  return new ort.Tensor('float32', data, [1, 3, size, size]);
+}
+
 let sessions: Promise<{ det: ort.InferenceSession; rec: ort.InferenceSession }> | null = null;
 
 export function loadModels() {
@@ -57,7 +60,6 @@ export function loadModels() {
   return sessions;
 }
 
-// ------------------------------------------------------------ image
 export async function loadImage(file: Blob): Promise<ImageData> {
   const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
   const s = Math.min(1, MAX_SIDE / Math.max(bmp.width, bmp.height));
@@ -71,7 +73,6 @@ export async function loadImage(file: Blob): Promise<ImageData> {
   return g.getImageData(0, 0, w, h);
 }
 
-// ------------------------------------------------------------ 1. detection
 async function detect(det: ort.InferenceSession, img: ImageData): Promise<Face[]> {
   // 長辺を 640 に合わせ、左上に詰めて 640x640 に（残りは黒）
   const ratio = img.height / img.width;
@@ -88,14 +89,7 @@ async function detect(det: ort.InferenceSession, img: ImageData): Promise<Face[]
   g.drawImage(src, 0, 0, nw, nh);
   const px = g.getImageData(0, 0, DET_SIZE, DET_SIZE).data;
 
-  const n = DET_SIZE * DET_SIZE;
-  const input = new Float32Array(3 * n);
-  for (let i = 0; i < n; i++) {
-    input[i] = (px[i * 4] - 127.5) / 128; // R
-    input[n + i] = (px[i * 4 + 1] - 127.5) / 128; // G
-    input[2 * n + i] = (px[i * 4 + 2] - 127.5) / 128; // B
-  }
-  const out = await det.run({ [det.inputNames[0]]: new ort.Tensor('float32', input, [1, 3, DET_SIZE, DET_SIZE]) });
+  const out = await det.run({ [det.inputNames[0]]: toTensor(px, DET_SIZE, 128) });
   const o = det.outputNames.map((k) => out[k].data as Float32Array);
 
   // 出力: scores(8,16,32), bbox(8,16,32), kps(8,16,32)。各位置にアンカー 2 個
@@ -137,7 +131,6 @@ function nms(faces: Face[]): Face[] {
   return keep;
 }
 
-// ------------------------------------------------------------ 2. alignment
 /** 5 点 → 基準位置 の相似変換 (最小二乗, Umeyama と同じ解)。[a, b, tx, ty]: x' = a x - b y + tx, y' = b x + a y + ty */
 export function similarity(src: number[][], dst: number[][]): [number, number, number, number] {
   const n = src.length;
@@ -197,22 +190,13 @@ export function warp112(img: ImageData, kps: number[][]): ImageData {
   return out;
 }
 
-// ------------------------------------------------------------ 3. recognition
 async function embed(rec: ort.InferenceSession, face: ImageData): Promise<Float32Array> {
-  const n = 112 * 112;
-  const input = new Float32Array(3 * n);
-  for (let i = 0; i < n; i++) {
-    input[i] = (face.data[i * 4] - REC_MEAN) / REC_STD;
-    input[n + i] = (face.data[i * 4 + 1] - REC_MEAN) / REC_STD;
-    input[2 * n + i] = (face.data[i * 4 + 2] - REC_MEAN) / REC_STD;
-  }
-  const out = await rec.run({ [rec.inputNames[0]]: new ort.Tensor('float32', input, [1, 3, 112, 112]) });
+  const out = await rec.run({ [rec.inputNames[0]]: toTensor(face.data, 112, 127.5) });
   const v = Float32Array.from(out[rec.outputNames[0]].data as Float32Array);
   const norm = Math.hypot(...v) || 1;
   return v.map((x) => x / norm);
 }
 
-// ------------------------------------------------------------ public
 export async function extractFace(img: ImageData, onStatus?: (s: string) => void): Promise<FaceResult> {
   onStatus?.('顔認識モデルを読み込んでいます（初回のみ・約 16MB）…');
   const { det, rec } = await loadModels();

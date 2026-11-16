@@ -1,29 +1,20 @@
-"""Colab 用: Drive の写真から索引と配信用画像を作り、R2 にアップロードする。
+"""Colab 用: Drive の写真から顔の索引と配信用画像を作り、R2 に上げる。
 
-使い方 (Colab, GPU ランタイム推奨):
     !pip install -q insightface onnxruntime-gpu pillow-heif boto3
-    # このファイルの中身をセルに貼る（または %run build_index.py）
-    prepare()          # Drive 認証・モデル読み込み・写真一覧
-    start_build()      # バックグラウンドで 元画像DL → 縮小画像 → 顔の特徴量（途中から再開可）
-    progress()         # 進捗
-    write_index()      # /content/hff/index/meta.json, embeddings.bin を作る
-    upload_r2()        # R2 へアップロード（Colab のシークレットに R2 の鍵を入れておく）
+    FOLDER_ID = '...'    # 写真の Drive フォルダ ID
+    prepare()            # Drive 認証・モデル読み込み・写真一覧
+    start_build()        # 元画像 DL → 縮小画像 → 顔の特徴量（バックグラウンド・再開可）
+    progress()
+    evaluate(pseudo_identities(), grid)   # しきい値の検討
+    write_index({...})   # index/ を作る（しきい値も meta.json に入る）
+    upload_r2()          # シークレット R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY が必要
 
 R2 のキー:
-    orig/{id}.jpg       元画像（バイト列そのまま）
-    large/{id}.webp     長辺 1600px
-    thumb/{id}.webp     長辺 400px
-    index/meta.json     { version, dim, photos: [{id,name,width,height,bytes}], facePhoto: [...] }
-    index/embeddings.bin  int8 (顔の数 x 512) = round(L2正規化特徴量 * 127)
-    index/embeddings_hq.bin  同じ顔の antelopev2 (glintr100) 特徴量。int8 (顔の数 x 512)
+    orig/{id}.jpg  large/{id}.webp (1600px)  thumb/{id}.webp (400px)
+    index/meta.json  index/embeddings.bin (buffalo_s)  index/embeddings_hq.bin (antelopev2)
 
-顔認識は buffalo_s (det_500m + w600k_mbf)。ブラウザ側 (web/src/face.ts) と同じモデル・前処理
-（ブラウザと Python で同じ画像の特徴量が一致することを確認済み）。
-索引側だけは集合写真の小さい顔・横顔を拾うため、元解像度の画像を antelopev2 の大きい検出器
-(scrfd_10g, det_size 1280) で検出し、そのランドマークで切り出した顔を buffalo_s の認識モデルにかける。
-さらに同じ顔 (同じ 5 点ランドマーク) を高精度モデル antelopev2 でも特徴量にしておき、
-Worker は「buffalo_s で見つけた確実な顔 → その顔の高精度特徴量で探し直す」の 2 段で検索する。
-しきい値は evaluate() で決めて meta.json に入れる。
+顔は元解像度の画像から antelopev2 の検出器 (scrfd_10g) で見つけ、同じ切り出しを
+buffalo_s（ブラウザと同じ）と antelopev2（高精度）の両方で特徴量にする。
 """
 
 import hashlib
@@ -39,15 +30,11 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from PIL import Image, ImageOps
 
-# 写真が入った Drive フォルダの ID。公開リポジトリには書かない（リンク共有のフォルダだと誰でも見られてしまう）
-FOLDER_ID = os.environ.get('HFF_DRIVE_FOLDER_ID', '')  # Colab では prepare() の前に FOLDER_ID = '...' を代入する
+FOLDER_ID = os.environ.get('HFF_DRIVE_FOLDER_ID', '')  # リポジトリには書かない
 OUT = '/content/hff'
-# 小さすぎる顔・自信の低い検出は索引に入れない（顔の一辺は元画像のピクセル数）
-MIN_FACE, MIN_DET = 48, 0.5
-# 索引側は集合写真の小さい顔も拾うため、元解像度の画像を 1280 で検出し、切り出しも元解像度から行う。
-# （ブラウザ側は自撮り 1 人なので 640 のままで良い。認識モデルが同じなので特徴量は比較できる）
-INDEX_DET_SIZE = 1280
-WORKERS = 6  # Drive の同時ダウンロード数。多すぎると 403 になる
+MIN_FACE, MIN_DET = 48, 0.5  # これ未満の顔（一辺 px・検出スコア）は索引に入れない
+INDEX_DET_SIZE = 1280  # 集合写真の小さい顔も拾う
+WORKERS = 6  # Drive の同時 DL 数。多いと 403
 LARGE, THUMB = 1600, 400
 API = 'https://www.googleapis.com/drive/v3/files'
 
@@ -55,7 +42,7 @@ G = {}  # sess, app, images, state, progress
 
 
 def photo_id(drive_id):
-    """Drive の ID をそのまま外に出さないよう、ハッシュした 16 桁を使う"""
+    """Drive の ID は外に出さず、ハッシュした 16 桁を使う"""
     return hashlib.sha256(f'hff:{drive_id}'.encode()).hexdigest()[:16]
 
 
@@ -86,8 +73,7 @@ def prepare():
     G['rec'] = rec
     print(f'buffalo_s rec ready ({"GPU" if gpu else "CPU"}), input_mean={rec.input_mean} std={rec.input_std}')
 
-    # 高精度モデル antelopev2: 検出 (scrfd_10g) と認識 (glintr100)
-    # 索引側の検出はブラウザと揃える必要がないので、横顔・小さい顔に強い大きい検出器を使う
+    # antelopev2: 検出 (scrfd_10g) と認識 (glintr100)
     d = os.path.expanduser('~/.insightface/models/antelopev2')
     if not glob.glob(f'{d}/glintr100.onnx'):
         os.makedirs(d, exist_ok=True)
@@ -170,11 +156,10 @@ def _worker():
                     st['errors'][f['pid']] = err
                     continue
                 faces = []
-                # 元解像度で検出・切り出し (BGR)
                 bgr = np.ascontiguousarray(np.asarray(im)[:, :, ::-1])
-                for fc in G['app'].get(bgr):  # 検出のみ (5 点ランドマーク付き)
+                for fc in G['app'].get(bgr):
                     x1, y1, x2, y2 = fc.bbox
-                    e = G['rec'].get(bgr, fc)  # 同じランドマークで切り出して 2 つのモデルにかける
+                    e = G['rec'].get(bgr, fc)
                     h = G['hq'].get(bgr, fc)
                     faces.append({'emb': (e / np.linalg.norm(e)).astype(np.float32),
                                   'hq': (h / np.linalg.norm(h)).astype(np.float32),
@@ -220,48 +205,42 @@ THRESHOLDS = {'seed': 0.5, 'sure': 0.5, 'maybe': 0.4, 'hqSure': 0.45, 'hqMaybe':
 
 
 def _q8(x):
-    """Worker と同じく int8 に量子化してから戻す"""
+    """int8 に量子化して戻す（Worker と同じ精度にする）"""
     return np.clip(np.round(x * 127), -127, 127) / 127
 
 
-def _matrices():
-    """索引に入る顔だけを並べた (buffalo_s 行列, 高精度行列, 写真 pid, 元の顔情報)"""
-    st = G['state']
-    E, H, pids, faces = [], [], [], []
+def _indexed_faces():
+    """索引に入れる (写真, 顔) を写真のパス順に返す"""
     for f in G['images']:
-        p = st['photos'].get(f['pid'])
+        p = G['state']['photos'].get(f['pid'])
         for fc in (p['faces'] if p else []):
             if fc['det'] >= MIN_DET and fc['side'] >= MIN_FACE:
-                E.append(fc['emb'])
-                H.append(fc['hq'])
-                pids.append(f['pid'])
-                faces.append(fc)
-    return _q8(np.stack(E)).astype(np.float32), _q8(np.stack(H)).astype(np.float32), np.array(pids), faces
+                yield p, fc
+
+
+def _matrices():
+    """(buffalo_s 行列, 高精度行列, 写真 id, 顔)。Worker と同じ量子化済み"""
+    rows = list(_indexed_faces())
+    E = _q8(np.stack([fc['emb'] for _, fc in rows])).astype(np.float32)
+    H = _q8(np.stack([fc['hq'] for _, fc in rows])).astype(np.float32)
+    return E, H, np.array([p['id'] for p, _ in rows]), [fc for _, fc in rows]
 
 
 def write_index(thresholds=None):
     if thresholds:
         THRESHOLDS.update(thresholds)
-    st = G['state']
-    photos, face_photo, embs, hqs = [], [], [], []
-    for f in G['images']:
-        p = st['photos'].get(f['pid'])
-        if not p:
-            continue
-        photos.append({k: p[k] for k in ['id', 'name', 'width', 'height', 'bytes']})
-        for fc in p['faces']:
-            if fc['det'] >= MIN_DET and fc['side'] >= MIN_FACE:
-                face_photo.append(len(photos) - 1)
-                embs.append(fc['emb'])
-                hqs.append(fc['hq'])
-    E = np.clip(np.round(np.stack(embs) * 127), -127, 127).astype(np.int8)
-    H = np.clip(np.round(np.stack(hqs) * 127), -127, 127).astype(np.int8)
-    E.tofile(f'{OUT}/index/embeddings.bin')
-    H.tofile(f'{OUT}/index/embeddings_hq.bin')
-    meta = {'version': time.strftime('%Y%m%d-%H%M%S'), 'dim': int(E.shape[1]), 'dimHq': int(H.shape[1]),
-            'thresholds': THRESHOLDS, 'photos': photos, 'facePhoto': face_photo}
+    done = G['state']['photos']
+    photos = [done[f['pid']] for f in G['images'] if f['pid'] in done]
+    number = {p['id']: i for i, p in enumerate(photos)}
+    rows = list(_indexed_faces())
+    for key, name in [('emb', 'embeddings.bin'), ('hq', 'embeddings_hq.bin')]:
+        m = np.stack([fc[key] for _, fc in rows])
+        np.clip(np.round(m * 127), -127, 127).astype(np.int8).tofile(f'{OUT}/index/{name}')
+    meta = {'version': time.strftime('%Y%m%d-%H%M%S'), 'dim': 512, 'dimHq': 512, 'thresholds': THRESHOLDS,
+            'photos': [{k: p[k] for k in ['id', 'name', 'width', 'height', 'bytes']} for p in photos],
+            'facePhoto': [number[p['id']] for p, _ in rows]}
     json.dump(meta, open(f'{OUT}/index/meta.json', 'w'), ensure_ascii=False, separators=(',', ':'))
-    print(f'索引: 写真 {len(photos)} 枚, 顔 {len(face_photo)} 個, しきい値 {THRESHOLDS}')
+    print(f'索引: 写真 {len(photos)} 枚, 顔 {len(rows)} 個, しきい値 {THRESHOLDS}')
 
 
 def search(query, t=None, use_hq=True, M=None, exclude_pid=None):
@@ -290,8 +269,7 @@ def search(query, t=None, use_hq=True, M=None, exclude_pid=None):
 
 
 def pseudo_identities(link=0.55, min_photos=6):
-    """高精度特徴量で「確実に同一人物」の顔をつなぎ、評価用の正解グループを作る。
-    つながりは厳しめ (link) にし、くっきり写った顔だけを使う。"""
+    """評価用の正解グループ: くっきり写った顔を、高精度特徴量の類似度 link 以上でつなぐ"""
     E, H, pids, faces = _matrices()
     clear = np.array([fc['det'] >= 0.7 and fc['side'] >= 80 for fc in faces])
     idx = np.where(clear)[0]
@@ -315,9 +293,8 @@ def pseudo_identities(link=0.55, min_photos=6):
 
 
 def evaluate(groups, grid, queries_per_person=3, seed=0):
-    """各グループから顔を 1 つ選んで「参加者の自撮り」の代わりにし、残りの写真をどれだけ見つけるか。
-    正解 = そのグループの写真 + 高精度モデルでグループ平均に近い (>=0.5) 顔がある写真。
-    grid: [(名前, しきい値 dict, use_hq)]。recall / 余計に出た写真の割合 を表示する。"""
+    """各グループの顔を自撮りの代わりに検索し、見つけた割合と余計に出た割合を表示する。
+    正解 = グループの写真 + 高精度でグループ平均に 0.5 以上近い顔の写真。grid: [(名前, しきい値, use_hq)]"""
     rng = np.random.default_rng(seed)
     M = _matrices()
     E, H, pids, faces = M
@@ -343,7 +320,6 @@ def evaluate(groups, grid, queries_per_person=3, seed=0):
 
 
 def upload_r2(bucket='hackathon-photos', workers=32):
-    """Colab のシークレット (鍵マーク) に R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY を入れておく"""
     import boto3
     from botocore.config import Config
     from google.colab import userdata
@@ -378,7 +354,7 @@ def upload_r2(bucket='hackathon-photos', workers=32):
 
     with ThreadPoolExecutor(workers) as ex:
         list(ex.map(put, jobs))
-    # 索引は最後に置く（画像が揃ってから検索に出るように）
+    # 索引は最後（画像が揃ってから検索に出す）
     for name in ['embeddings.bin', 'embeddings_hq.bin']:
         s3.upload_file(f'{OUT}/index/{name}', bucket, f'index/{name}',
                        ExtraArgs={'ContentType': 'application/octet-stream'})

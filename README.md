@@ -4,10 +4,27 @@
 Cloudflare Workers + R2。共通パスワードで保護。設計は [PLAN.md](PLAN.md)。
 
 ```
-web/          フロント (Vite + TypeScript)。顔の特徴量はブラウザ内で計算 (onnxruntime-web)
-worker/       Worker (API: login / session / search / img / dl)
-preprocess/   Colab で索引と配信用画像を作り R2 に上げるスクリプト
-scripts/      モデル取得・ローカル用の偽データ
+web/src/
+  main.ts          画面の切り替え（ログイン → 顔写真 → 結果）
+  views/           各画面: login / upload / results / viewer（拡大表示）
+  face.ts          顔検出・位置合わせ・特徴量（onnxruntime-web, buffalo_s）
+  api.ts           Worker の API クライアント（api.mock.ts はバックエンド無しで動かす偽物）
+  zip.ts           元画像をまとめて ZIP 保存
+worker/src/
+  index.ts         ルーティングと login / search
+  auth.ts          パスワード照合・署名付き Cookie
+  search.ts        索引の読み込みと 2 段階の照合
+  photos.ts        R2 の写真を返す
+preprocess/        Colab で索引と配信用画像を作り R2 に上げるスクリプト
+scripts/           モデル取得・ローカル用の偽データ
+```
+
+```
+ブラウザ ── 自撮りを 512 個の数値に変換（写真は送らない）
+   │  POST /api/search
+Worker ── R2 の索引と照合 → 写真の一覧 / 画像を返す（Cookie で認証）
+   │
+R2 ── orig/ large/ thumb/ index/   ← Colab (preprocess/) が事前に作る
 ```
 
 ## ローカルで動かす

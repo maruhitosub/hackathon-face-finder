@@ -97,43 +97,6 @@ p {
   backdrop-filter: blur(8px);
   border-bottom: 1px solid color-mix(in srgb, var(--ink) 10%, transparent);
 }
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  color: inherit;
-  text-decoration: none;
-}
-.brand-mark {
-  display: flex;
-  gap: 3px;
-}
-.brand-mark i {
-  width: 9px;
-  height: 22px;
-  border-radius: 99px;
-  background: var(--red);
-}
-.brand-mark i:nth-child(2) {
-  background: var(--green);
-  translate: 0 4px;
-}
-.brand-mark i:nth-child(3) {
-  background: var(--blue);
-}
-.brand-text {
-  display: flex;
-  flex-direction: column;
-  font-weight: 900;
-  font-size: 1.05rem;
-  letter-spacing: 0.02em;
-  line-height: 1;
-}
-.brand-text small {
-  font-size: 0.5rem;
-  letter-spacing: 0.14em;
-  margin-bottom: 3px;
-}
 .steps {
   margin-left: auto;
   display: flex;
@@ -739,9 +702,6 @@ main {
   }
   .steps sup {
     display: none;
-  }
-  .brand-text {
-    font-size: 0.9rem;
   }
   .bar {
     gap: 12px;
