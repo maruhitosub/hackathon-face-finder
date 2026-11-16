@@ -1,0 +1,33 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "jisaku", // Tompedia_Labo の管理者が用意した Worker（この Worker への権限だけ付いている）
+  "account_id": "5191b613f9bb6f30cb05a83e66d41a72", // Tompedia_Labo
+  "main": "worker/src/index.ts",
+  "compatibility_date": "2026-11-16",
+  "observability": { "enabled": true },
+  "workers_dev": false, // jisaku.tompedia.workers.dev は使わない
+  "preview_urls": false, // バージョンごとの公開 URL は作らない
+  // 公開 URL（tohoku.app ゾーンに Worker のカスタムドメインとして付ける。DNS と証明書は Cloudflare が自動で作る）
+  "routes": [{ "pattern": "facefinder.tohoku.app", "custom_domain": true }],
+
+  // フロント (web/dist) は静的配信。API と画像だけ Worker を通す
+  "assets": {
+    "directory": "web/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/img/*", "/dl/*"]
+  },
+
+  // 写真・索引を置く非公開バケット
+  "r2_buckets": [{ "binding": "PHOTOS", "bucket_name": "hackathon-photos" }],
+
+  // ログインの総当たり対策: IP ごとに 1 分 10 回まで
+  "ratelimits": [{ "name": "LOGIN_LIMITER", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } }],
+
+  "vars": {
+    // 類似度のしきい値は索引 (index/meta.json の thresholds) に入れて、Colab の検証結果と一緒に更新する
+    "SESSION_DAYS": "7"
+  }
+  // シークレット (wrangler secret put): SITE_PASSWORD, SESSION_SECRET
+  // ローカルは .dev.vars に書く
+}
