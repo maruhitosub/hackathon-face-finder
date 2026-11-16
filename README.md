@@ -1,7 +1,7 @@
 # Hackathon Face Finder
 
 ハッカソンの写真の中から、顔写真 1 枚で自分が写っている写真を探して一覧・ダウンロードできるサイト。
-Cloudflare Workers + R2。共通パスワードで保護。設計は [PLAN.md](PLAN.md)。
+Cloudflare Workers + R2。共通パスワードで保護。しくみの解説は [GUIDE.md](GUIDE.md)。
 
 ```
 web/src/
