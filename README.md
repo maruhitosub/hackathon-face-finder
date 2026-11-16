@@ -54,21 +54,6 @@ npm run dev           # フロントをビルドして wrangler dev → http://l
 
 `search(embedding)` で Worker と同じ検索を Colab 上で試せる。
 
-## デプロイ (Tompedia_Labo アカウント)
-
-公開 URL: **https://facefinder.tohoku.app**（Worker `jisaku` のカスタムドメイン。workers.dev は無効）
-
-```bash
-npx wrangler login
-npx wrangler r2 bucket create hackathon-photos   # 作成済み
-npm run deploy                                    # 初回は --secrets-file で SESSION_SECRET も渡す
-npx wrangler secret put SITE_PASSWORD             # 参加者に配るパスワード（自分で入力）
-```
-
-- アカウントに R2 と Workers の両方の権限が必要（Tompedia_Labo の管理者に付けてもらう）
-- 索引を作り直したら `index/` を上げ直すだけで Worker が読み直す（meta.json の etag で検知）。再デプロイ不要
-- **Workers 有料プラン ($5/月) が必要**。検索 1 回で 1 万顔 × 512 次元の内積を 2 回（約 13ms）。無料プランの CPU 上限 10ms を超える
-
 ## 検索のしくみ
 
 1. ブラウザで自撮りを buffalo_s (軽いモデル) で 512 次元に変換して送る
